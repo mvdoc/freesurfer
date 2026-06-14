@@ -8,6 +8,14 @@ changed, and what is the most likely cause?
 was traced against the upstream tags available in the fork (`v6.0.0` … `v8.2.0`) using the
 GitHub API, and cross-checked against the current source tree in this repo.
 
+> **Update (2026‑06‑14): empirical results are in — see the new section below.**
+> A side-by-side run of FS6 vs FS8 on the same patch **confirms the regression** but
+> **refutes the original top hypothesis (H1)**: the sampled target distances (`dist_orig`)
+> are essentially identical between versions, so the cause is on the *optimizer* side, not
+> the *target* side. The ranking and the "next steps" below have been revised accordingly,
+> and one factual error in the original draft has been corrected (the
+> `MRIS_SPHERE_NEW_BEHAVIOR` env gate **does** affect the flatten path).
+
 ---
 
 ## TL;DR
@@ -31,6 +39,83 @@ GitHub API, and cross-checked against the current source tree in this repo.
    minimization driven entirely by those sampled distances, even a small change in which
    neighbors are sampled or how edge-length distances are accumulated produces a visibly
    different (and sometimes failed) flat map — exactly the reported symptom.
+
+---
+
+## Empirical validation (follow-up run, 2026‑06‑14)
+
+An independent run put the identical patch (sub‑190 rh, continuity-only projection) through
+both binaries with bare default parameters, `OMP_NUM_THREADS=8`:
+FS6 (`freesurfer-6.0`, Jan 2017) vs FS8 (`freesurfer-8.0.0`, build 8.0.0‑20250204). Both
+printed identical defaults, re-confirming the "defaults unchanged" claim.
+
+**Regression confirmed** (independent scoring of the final maps):
+
+| | flipped triangles | Fischl J_d | rel. distortion | opt scale |
+|---|---|---|---|---|
+| FS6 | 5 / 322,629 (0.002%) | 0.863 mm | 22.2% | 0.915 |
+| FS8 | 6,920 / 322,629 (2.145%) | 1.915 mm | 48.8% | 0.587 |
+
+FS8 ends ~1,400× more flipped, ~2.2× the distortion, and over-folded (opt scale 0.59 —
+the boundary curls into petals). Mid-run FS8 diverged to **38.7% flipped** before partially
+recovering, and took 860 vs FS6's 600 iterations. On a harder patch the 38% excursion may not
+recover at all — that is the total-failure mode the user reports.
+
+**H1 is refuted (the key correction).** Using `FS_MEASURE_DISTANCES=1` (which dumps
+`distance.log` as `(current_d, dist_orig)` pairs and then exits), over all 16.4 M sampled
+pairs the targets (`dist_orig`) are essentially identical between versions:
+mean 2.7557 (FS6) vs 2.7553 (FS8); p50/p90/p99 ratios all 0.9998–1.0000. A
+`1.207 → 1.09` `TRIANGLE_DISTANCE_CORRECTION` change would have shifted every target ~10%;
+the observed global shift is **< 0.02%**. The rewrite does change *which* pairs are sampled
+(FS8 has +11,678 pairs, +0.07%) and perturbs ~28% of individual targets by a zero-mean ±1–3%,
+but it does **not** move target magnitudes systematically. **Identical targets ⇒ the cause is
+the optimizer (H3/H4), not the target (H1/H2).** H2's sampling change is real but far too
+small to explain a 2% flip rate.
+
+**Discriminating signature.** In the SSE breakdown, FS8's **area / negative-area energy term
+sits persistently ~3× lower than FS6's** (~15.5 vs ~40–50) across the entire run, i.e. FS8
+under-penalizes negative area and cannot prevent folding. (Both versions show large
+start-of-pass SSE spikes that then anneal — that is normal multi-pass behavior, *not* the
+regression; the regression shows up only in the final map quality and the persistent
+area-term magnitude gap.) H4 (alloc/clear timing, float/double, OMP ordering) would manifest
+as run-to-run noise, not a clean persistent ~3× offset, so it is unlikely to be primary.
+
+### What the code says about the area-energy gap (refinement of H3)
+
+The empirical signature is an **area-term** gap, but the two `1/avg_nbrs` sites
+(`mrisurf_compute_dxyz.cpp:2566`, `:2740`) scale the **distance** term, not the area term —
+and on the flatten path the relevant `avg_nbrs` looks the same in both versions:
+
+* `MRISsampleDistances_new` **recomputes** `avg_nbrs = total_nbrs / MRISvalidVertices` over the
+  *expanded* sampled set (`mrisurf_vals.cpp:4074`), exactly as v6 did — and the measured
+  neighbor-count difference is only +0.07%. So the distance-term normalization during the main
+  integration epochs is, to first order, **not** different between versions.
+
+Two consequences:
+
+1. The ~3× **area**-energy gap is therefore more plausibly a **symptom** of over-folding than
+   its direct cause — the optimizer lets the patch fold, and the (lower) area energy is what a
+   folded-but-cheap configuration looks like to the SSE.
+2. The one `avg_nbrs` manipulation that *is* reachable on the flatten path **and** is
+   version-gated is the final fold-removal block inside `MRISunfold`
+   (`mrisurf_integrate.cpp:2543-2547`):
+   ```c
+   float incorrect_avg_nbrs = mris->avg_nbrs;        // expanded value from sampling
+   MRISresetNeighborhoodSize(mris, 1);                // recomputes avg_nbrs to ~1-ring (~6)
+   if (getenv("MRIS_SPHERE_NEW_BEHAVIOR") == nullptr) // DEFAULT: restore the old/large value
+     mris->avg_nbrs = incorrect_avg_nbrs;
+   mrisRemoveNegativeArea(mris, parms, base_averages > 32 ? 32 : base_averages, MAX_NEG_AREA_PCT, 2);
+   ```
+   This block **runs for flattening** (a flatten is `MRIS_PLANE`, and this is in the common
+   body of `MRISunfold`, before the plane-only smoothing at `:2549`). It tries to *emulate*
+   the old/v6 behavior by default; if that emulation is imperfect — e.g. `avg_nbrs` entering
+   the block differs from what v6 actually had there — this is exactly where a clean,
+   persistent force-scaling offset in the fold-removal phase would come from.
+
+**Correction to the original draft:** I previously wrote that `MRIS_SPHERE_NEW_BEHAVIOR` /
+`MRIS_REGISTER_NEW_BEHAVIOR` "do not affect the flatten path." That is wrong for
+`MRIS_SPHERE_NEW_BEHAVIOR`: it gates lines `2543-2545`, which are inside `MRISunfold` and run
+on every flatten. This makes it a **rebuild-free experiment** (see step 1 below).
 
 ---
 
@@ -144,40 +229,51 @@ fragility here.
 
 ---
 
-## Hypotheses, ranked
+## Hypotheses, ranked (revised after empirical testing)
 
-| # | Hypothesis | Confidence | Why |
-|---|-----------|-----------|-----|
-| **H1** | The `MRISsampleDistances` rewrite + `VERTEX_TOPOLOGY` split changed the sampled `dist_orig` target distances, so the optimizer now minimizes toward a different metric. | **High** | Flattening is *defined* by `dist_orig`; the commit explicitly "fixed bugs" and changed `nsize` semantics; current code uses the `_new` implementation unconditionally. |
-| **H2** | The neighborhood-init change in `mris_flatten.c` (`nsize` → `nsizeMax`, plus `...AndDist`) feeds a different neighborhood into distance sampling. | Medium | Directly post-v6, directly in the tool, changes what gets sampled. |
-| **H3** | The flatten path now runs with the post-refactor `avg_nbrs`, mis-scaling the spring/smoothing forces — and unlike register/sphere there is no compatibility gate. | Medium | `avg_nbrs` scales the deformation/smoothing terms; the devs flagged it "incorrect" elsewhere but never pinned it for flattening. |
-| **H4** | Secondary effects of the refactor: `dist`/`dist_orig` (re)allocation/clear timing, `float`↔`double`, or OpenMP-induced ordering differences. | Low–Medium | "managed xyz/dist" commits touched exactly this; would add noise/instability rather than a clean offset. |
+| # | Hypothesis | Status | Evidence |
+|---|-----------|--------|----------|
+| **H1** | The `MRISsampleDistances` rewrite moved the sampled `dist_orig` *target* distances. | **Refuted** | `distance.log` targets identical to <0.02% over 16.4 M pairs; a 1.207→1.09 correction would have shifted them ~10%. |
+| **H2** | Neighborhood-init / sampling change feeds a different neighbor set. | Real but **insufficient** | Only +0.07% more sampled pairs, zero-mean ±1–3% per-pair jitter — far too small to explain a 2% flip rate. |
+| **H3** | The flatten optimizer under-penalizes negative area (force/energy scaling), letting the patch over-fold. | **Leading** | FS8's area/neg-area SSE term persistently ~3× lower; final map is over-folded (opt scale 0.59, petals). Mechanism still to be pinned: the distance-term `1/avg_nbrs` is ~unchanged during the main epochs (`vals.cpp:4074`), so the prime suspect is the **gated fold-removal block** `mrisurf_integrate.cpp:2543-2547` and/or `mrisRemoveNegativeArea` itself. |
+| **H4** | Refactor side-effects: alloc/clear timing, `float`↔`double`, OMP ordering. | Unlikely primary | Would produce run-to-run noise, not a clean persistent ~3× offset. |
 
-All four share the same root cause: **the 2018–2019 `mrisurf` rewrite between v6.0.0 and
-v7.0.0**, not any change to `mris_flatten` arguments or defaults.
+Net: the regression is **real and reproducible**, lives on the **optimizer** side (negative-area
+control during unfolding), and originates in the **2018–2019 `mrisurf` rewrite** between v6.0.0
+and v7.0.0 — not in `mris_flatten`'s arguments, defaults, or the sampled target distances.
 
 ---
 
-## Suggested next steps to confirm
+## Suggested next steps to confirm (revised)
 
-1. **Localize the break to a release.** Build `v7.0.0` and rerun the same patch with
-   `mris_flatten -norand <in> <out>`. If v7.0.0 already fails, the cause is the 2018 refactor
-   (consistent with H1–H3); this rules out anything added in v7.x/v8.x.
-2. **Diff the preserved metric directly.** Run with `FS_MEASURE_DISTANCES=1` (handled in
-   `MRISunfold`, `mrisurf_integrate.cpp:2396`) under both v6 and v8 on the identical patch and
-   diff the resulting `distance.log` (`d` vs `dist_orig`). A systematic difference there
-   confirms H1/H2 (the target itself moved); a matching target but different output points to
-   H3/H4 (the optimizer/force scaling).
-3. **Compare the `flatten.log` distance-error traces** ("starting/final distance error %%")
-   between versions to see whether v8 starts from a worse metric or merely converges worse.
-4. **Probe `avg_nbrs`.** Add a debug print of `mris->avg_nbrs` just before the `MRISunfold`
-   call in both versions; if they differ, H3 is in play. (The `MRIS_SPHERE_NEW_BEHAVIOR` /
-   `MRIS_REGISTER_NEW_BEHAVIOR` env vars do **not** affect the flatten path, so they won't fix
-   it — but they confirm the developers' awareness of the `avg_nbrs` problem.)
-5. **Targeted bisect** of the 2018 refactor PRs in upstream order:
-   `92c2723b`/`1b9de0a` (topology split) → `e25a048`/`156a430` (MRISsampleDistances rewrite) →
-   `624ffc0a`/`dd421275` (managed xyz/dist) → `9bb0608` (neighborhood reset in the tool).
-   H1 predicts the break lands at the `MRISsampleDistances` rewrite.
+Now that H1 is ruled out and H3 leads, the cheapest discriminators come first:
+
+1. **Rebuild-free env-gate test (do this first).** On FS8 run
+   `MRIS_SPHERE_NEW_BEHAVIOR=1 mris_flatten -norand <in> <out>` and re-score. This flips the
+   `avg_nbrs` used by the fold-removal block (`mrisurf_integrate.cpp:2543-2545`) from the
+   "old/large" emulated value to the recomputed 1-ring value. If the flip rate / petal-folding
+   changes materially, the regression is localized to that block's `avg_nbrs` handling
+   (i.e. the v6 emulation is imperfect). If nothing changes, the negative-area control problem
+   is upstream of it — look at `mrisRemoveNegativeArea` and the area-term SSE/gradient
+   (`mrisComputeNonlinearAreaSSE` / `mrisurf_sseTerms.cpp`).
+2. **Instrument the per-term energies and `avg_nbrs`.** In a source build, print `mris->avg_nbrs`
+   plus each SSE component (dist, area, neg-area, spring, angle) at the top of every
+   `mrisIntegrationEpoch` in both v6 and v8 on the same patch, and diff. The empirical run
+   already shows the ~3× **area** gap; this pins *which* term/coefficient and *when* the two
+   versions diverge (main epochs vs the `:2543-2547` fold-removal vs the `:2549` plane smoothing).
+3. **Bisect the negative-area path, not the sampler.** With H1 dead, bisect the 2018 refactor in
+   upstream order but watch the **area/neg-area** machinery rather than `MRISsampleDistances`:
+   `92c2723b`/`1b9de0a` (topology split) → `624ffc0a`/`dd421275` (managed xyz/dist, rip/area
+   handling) → `9bb0608` (neighborhood reset in the tool). The `e25a048`/`156a430`
+   `MRISsampleDistances` rewrite can be deprioritized (targets proven identical).
+4. **Candidate fix to prototype** (once step 1/2 localizes it): add a `MRIS_FLATTEN_*` style
+   compatibility gate — or, better, make the fold-removal `avg_nbrs` consistent with the
+   neighborhood actually used by `mrisRemoveNegativeArea` — so FS8's negative-area penalty
+   matches FS6's during unfolding. Validate by re-scoring flip-rate / J_d / opt-scale against
+   the FS6 numbers in the table above.
+
+Artifacts from the follow-up run (both flat patches, both `distance.log`s, scoring/plotting
+scripts, side-by-side figure) live at `/data2/projects/autoflatten/fs_regression/`.
 
 ---
 
@@ -188,7 +284,10 @@ v7.0.0**, not any change to `mris_flatten` arguments or defaults.
 - `mris_flatten/mris_flatten.cpp:511-522` — `MRISreadOriginalProperties` → `MRISflattenPatch` →
   `MRISscaleBrain` → `MRISunfold`.
 - `utils/mrisurf_vals.cpp:3484-3689` — rewritten `MRISsampleDistances`/`MRISsampleDistances_new`.
+- `utils/mrisurf_vals.cpp:4074` — `MRISsampleDistances_new` recomputes `avg_nbrs` over the
+  expanded sampled set (same as v6) — why the distance-term scaling is ~unchanged in the main epochs.
 - `utils/mrisurf_integrate.cpp:2283-2587` — `MRISunfold`; `:2376-2384` samples `dist_orig`;
-  `:2543-2545` `avg_nbrs` hack.
+  `:2543-2547` the `MRIS_SPHERE_NEW_BEHAVIOR`-gated `avg_nbrs` fold-removal hack **that runs on
+  the flatten path** (leading suspect for H3).
 - `utils/mrisurf_compute_dxyz.cpp:2566,2740` — spring/smoothing terms scaled by `1/avg_nbrs`.
 - `utils/mrisurf_metricProperties.cpp:4269` — `MRISsetNeighborhoodSizeAndDist`.
