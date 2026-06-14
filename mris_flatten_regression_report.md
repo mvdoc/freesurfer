@@ -8,13 +8,17 @@ changed, and what is the most likely cause?
 was traced against the upstream tags available in the fork (`v6.0.0` … `v8.2.0`) using the
 GitHub API, and cross-checked against the current source tree in this repo.
 
-> **Update (2026‑06‑14): empirical results are in — see the new section below.**
-> A side-by-side run of FS6 vs FS8 on the same patch **confirms the regression** but
-> **refutes the original top hypothesis (H1)**: the sampled target distances (`dist_orig`)
-> are essentially identical between versions, so the cause is on the *optimizer* side, not
-> the *target* side. The ranking and the "next steps" below have been revised accordingly,
-> and one factual error in the original draft has been corrected (the
-> `MRIS_SPHERE_NEW_BEHAVIOR` env gate **does** affect the flatten path).
+> **Update (2026‑06‑14): empirical results + step‑1 are in — see the sections below.**
+> A side-by-side FS6 vs FS8 run **confirms the regression** (deterministic) and successively
+> **refutes** the original top hypothesis H1 (sampled `dist_orig` targets are identical), the
+> sampler rewrite, and — via the rebuild-free env-gate test (step 1) — the gated fold-removal
+> `avg_nbrs` block (H3). The decisive new fact: the ~3× negative-area SSE gap **is already
+> present at iteration 0**, and since `area_scale == 1.0` for a patch the energy is a pure
+> `Σ f(face.area())` with no normalization — so the cause is the **initial flattened state /
+> ripped-face set** (the 2018 "managed xyz/dist + rip/area" refactor), not the sampler,
+> targets, `avg_nbrs`, or optimizer dynamics. Leading hypothesis is now **H5** (see table).
+> (One factual error in the original draft was corrected: `MRIS_SPHERE_NEW_BEHAVIOR` *does*
+> reach the flatten path.)
 
 ---
 
@@ -116,6 +120,63 @@ Two consequences:
 `MRIS_REGISTER_NEW_BEHAVIOR` "do not affect the flatten path." That is wrong for
 `MRIS_SPHERE_NEW_BEHAVIOR`: it gates lines `2543-2545`, which are inside `MRISunfold` and run
 on every flatten. This makes it a **rebuild-free experiment** (see step 1 below).
+
+### Step‑1 verdict (env-gate test) — gate refuted, cause is upstream and present at iteration 0
+
+The rebuild-free env-gate test was run (FS8, identical sub‑190 rh patch, `-norand`):
+
+| map | flipped | opt scale | Fischl J_d |
+|---|---|---|---|
+| FS6 reference | 5 (0.002%) | 0.915 | 0.863 mm |
+| FS8 `-norand` ctrl (env unset = v6 emulation) | 6,915 (2.143%) | 0.502 | 2.086 mm |
+| FS8 `MRIS_SPHERE_NEW_BEHAVIOR=1` | 7,230 (2.241%) | 0.794 | 1.576 mm |
+
+Conclusions from the run:
+
+* **Deterministic.** `-norand` ctrl (2.143%) reproduces the original no‑`-norand` FS8 run
+  (2.145%) — not a seed artifact.
+* **The gate is not the lever.** Toggling it barely moves the flip rate
+  (2.14% → 2.24%, marginally *worse*), nowhere near FS6's 0.002%. So the folding is **not**
+  localized to the `:2543-2547` fold-removal `avg_nbrs` block. (It does shift the *distance*
+  metrics — Fischl 1.58 vs 2.09 mm, opt scale 0.79 vs 0.50 — confirming it changes the
+  spring/smoothing `avg_nbrs`, but that is orthogonal to the flip pathology.)
+* **The defect is present at iteration 0.** The ~3× area-term SSE gap (FS8 ~15.5 vs FS6 ~46)
+  exists *before the gated fold-removal block ever runs*, and the "v6 emulation" default does
+  not recover v6's flip behavior. **The divergence is baked into the initial state.**
+
+This kills two more hypotheses: the fold-removal gate (H3 as originally framed) **and**,
+together with the already-refuted H1, the `MRISsampleDistances` rewrite. The remaining cause is
+in how FS8 **sets up the initial flat patch and its metric properties**.
+
+### What "iteration 0" + `area_scale` tells us (static narrowing)
+
+For a **patch**, the SSE constructor sets `area_scale = 1.0` (`mrisurf_sseTerms.cpp:74`,
+the `surface.patch() ? 1.0 : orig_area/total_area` branch). So the negative-area energy is
+
+```c
+// mrisurf_sseTerms.cpp:262-265, with area_scale == 1.0 for a patch
+ratio = clamp(face.area(), -MAX_NEG_RATIO, MAX_NEG_RATIO);
+error = log(1 + exp(NEG_AREA_K * ratio)) / NEG_AREA_K - ratio;   // summed over un-ripped faces
+```
+
+i.e. **`Σ_faces f(face.area())` with no `orig_area/total_area` normalization at all.** Therefore
+the iteration‑0 ~3× gap **cannot** come from metric-scale normalization, `orig_area`,
+`total_area`, `dist_orig`, or `avg_nbrs`. It can only come from one of:
+
+1. the **initial face areas** themselves — i.e. the `MRISflattenPatch` projection
+   (`utils/mrisurf_deform.cpp:2172`) and the `MRISscaleBrain(scale=3)` + `MRIScomputeMetricProperties`
+   that follow produce a different initial 2‑D layout / different signed (folded) triangle areas; or
+2. the **set of un-ripped faces** being summed — i.e. the rip/face bookkeeping differs
+   (`MRISremoveRipped`, and v6's `MRISripFaces` vs v8's `MRISsetRipInFacesWithRippedVertices`,
+   plus the new `vnum == 0` vertex-rip block at `mris_flatten.cpp:350-355`).
+
+Both (1) and (2) live precisely in the **2018 "managed xyz/dist + rip/area" commits
+(`624ffc0a`, `dd421275`)** and the metric-properties/orientation code — exactly where the
+empirical agent recommended bisecting, and now independently confirmed by the area_scale
+analysis to be the only code paths that *can* produce this signature.
+
+> Provenance: ledger `bb6e37461b5b` (main investigation) and `025f5efea56d` (step‑1).
+> Step‑1 artifacts: `/data2/projects/autoflatten/fs_regression/fs8_{ctrl,sphere}/`.
 
 ---
 
@@ -229,51 +290,52 @@ fragility here.
 
 ---
 
-## Hypotheses, ranked (revised after empirical testing)
+## Hypotheses, ranked (revised after empirical testing + step‑1)
 
 | # | Hypothesis | Status | Evidence |
 |---|-----------|--------|----------|
-| **H1** | The `MRISsampleDistances` rewrite moved the sampled `dist_orig` *target* distances. | **Refuted** | `distance.log` targets identical to <0.02% over 16.4 M pairs; a 1.207→1.09 correction would have shifted them ~10%. |
-| **H2** | Neighborhood-init / sampling change feeds a different neighbor set. | Real but **insufficient** | Only +0.07% more sampled pairs, zero-mean ±1–3% per-pair jitter — far too small to explain a 2% flip rate. |
-| **H3** | The flatten optimizer under-penalizes negative area (force/energy scaling), letting the patch over-fold. | **Leading** | FS8's area/neg-area SSE term persistently ~3× lower; final map is over-folded (opt scale 0.59, petals). Mechanism still to be pinned: the distance-term `1/avg_nbrs` is ~unchanged during the main epochs (`vals.cpp:4074`), so the prime suspect is the **gated fold-removal block** `mrisurf_integrate.cpp:2543-2547` and/or `mrisRemoveNegativeArea` itself. |
-| **H4** | Refactor side-effects: alloc/clear timing, `float`↔`double`, OMP ordering. | Unlikely primary | Would produce run-to-run noise, not a clean persistent ~3× offset. |
+| **H1** | The `MRISsampleDistances` rewrite moved the sampled `dist_orig` *target* distances. | **Refuted** | `distance.log` targets identical to <0.02% over 16.4 M pairs. |
+| **H2** | Neighborhood-init / sampling change feeds a different neighbor set. | Real but **insufficient** | Only +0.07% more sampled pairs, zero-mean ±1–3% jitter. |
+| **H3** | The gated fold-removal `avg_nbrs` block (`:2543-2547`) under-penalizes negative area. | **Refuted (step 1)** | Toggling `MRIS_SPHERE_NEW_BEHAVIOR` moves flip rate only 2.14%→2.24%; and the ~3× area gap is present at iteration 0, *before* this block runs. |
+| **H5** | FS8 builds a **different initial flat state / un-ripped face set**, so the negative-area energy (`area_scale==1.0`, pure `Σ f(face.area())`) is ~3× off from the first SSE evaluation, and the optimizer folds from there. | **Leading** | ~3× area gap at iteration 0; `area_scale` analysis excludes every normalization/target/`avg_nbrs` path; opt scale collapses (0.92→0.50). Localizes to `MRISflattenPatch`/`MRIScomputeMetricProperties` and rip/face bookkeeping (`624ffc0a`/`dd421275`). |
+| **H4** | Refactor side-effects: alloc/clear timing, `float`↔`double`, OMP ordering. | Unlikely primary | Deterministic (`-norand` reproduces); a clean persistent ~3× offset, not noise. |
 
-Net: the regression is **real and reproducible**, lives on the **optimizer** side (negative-area
-control during unfolding), and originates in the **2018–2019 `mrisurf` rewrite** between v6.0.0
-and v7.0.0 — not in `mris_flatten`'s arguments, defaults, or the sampled target distances.
+Net: the regression is **real, reproducible, and deterministic**; it is **baked into the
+initial flattened state** (negative-area energy wrong from iteration 0), and originates in the
+**2018–2019 `mrisurf` rewrite** — specifically the initial-projection / metric-properties /
+rip-area bookkeeping, **not** the sampler, the targets, `avg_nbrs`, or the fold-removal gate.
 
 ---
 
-## Suggested next steps to confirm (revised)
+## Suggested next steps to confirm (revised after step‑1)
 
-Now that H1 is ruled out and H3 leads, the cheapest discriminators come first:
+Step 1 (rebuild-free env-gate test) is **done** — it refuted the gate and showed the defect is
+present at iteration 0. The rebuild-free discriminators are now exhausted; the remaining steps
+need a source build of FS7/FS8 (out of scope for the box that ran step 1). Ordered by power:
 
-1. **Rebuild-free env-gate test (do this first).** On FS8 run
-   `MRIS_SPHERE_NEW_BEHAVIOR=1 mris_flatten -norand <in> <out>` and re-score. This flips the
-   `avg_nbrs` used by the fold-removal block (`mrisurf_integrate.cpp:2543-2545`) from the
-   "old/large" emulated value to the recomputed 1-ring value. If the flip rate / petal-folding
-   changes materially, the regression is localized to that block's `avg_nbrs` handling
-   (i.e. the v6 emulation is imperfect). If nothing changes, the negative-area control problem
-   is upstream of it — look at `mrisRemoveNegativeArea` and the area-term SSE/gradient
-   (`mrisComputeNonlinearAreaSSE` / `mrisurf_sseTerms.cpp`).
-2. **Instrument the per-term energies and `avg_nbrs`.** In a source build, print `mris->avg_nbrs`
-   plus each SSE component (dist, area, neg-area, spring, angle) at the top of every
-   `mrisIntegrationEpoch` in both v6 and v8 on the same patch, and diff. The empirical run
-   already shows the ~3× **area** gap; this pins *which* term/coefficient and *when* the two
-   versions diverge (main epochs vs the `:2543-2547` fold-removal vs the `:2549` plane smoothing).
-3. **Bisect the negative-area path, not the sampler.** With H1 dead, bisect the 2018 refactor in
-   upstream order but watch the **area/neg-area** machinery rather than `MRISsampleDistances`:
-   `92c2723b`/`1b9de0a` (topology split) → `624ffc0a`/`dd421275` (managed xyz/dist, rip/area
-   handling) → `9bb0608` (neighborhood reset in the tool). The `e25a048`/`156a430`
-   `MRISsampleDistances` rewrite can be deprioritized (targets proven identical).
-4. **Candidate fix to prototype** (once step 1/2 localizes it): add a `MRIS_FLATTEN_*` style
-   compatibility gate — or, better, make the fold-removal `avg_nbrs` consistent with the
-   neighborhood actually used by `mrisRemoveNegativeArea` — so FS8's negative-area penalty
-   matches FS6's during unfolding. Validate by re-scoring flip-rate / J_d / opt-scale against
-   the FS6 numbers in the table above.
+1. **Dump the iteration‑0 face state in both versions.** Before any integration (right after
+   `MRISflattenPatch` + `MRISscaleBrain` + `MRIScomputeMetricProperties`, i.e. the first SSE
+   eval), print per-face `area`, the **count of negative-area faces**, `mris->total_area`,
+   `mris->neg_area`, and `mris->nfaces`/ripped-face count, in FS6 and FS8 on the same patch.
+   Because `area_scale==1.0` for a patch, the area SSE is exactly `Σ f(face.area())`, so this
+   directly shows whether the ~3× gap is (a) different signed face areas — a different initial
+   projection — or (b) a different un-ripped face set. (Can be approximated rebuild-free via
+   `mris_flatten -w 1 …` and inspecting the first written surface's areas.)
+2. **Bisect the initial-state / rip-area path** (not the sampler, not the optimizer):
+   `92c2723b`/`1b9de0a` (topology split) → **`624ffc0a`/`dd421275` (managed xyz/dist + rip/area)**
+   → `9bb0608` (neighborhood/rip reset in the tool). Watch `MRISflattenPatch`,
+   `MRIScomputeMetricProperties`/`MRIScomputeTriangleProperties` (signed/negative area &
+   orientation), `MRISremoveRipped`, and `MRISripFaces` → `MRISsetRipInFacesWithRippedVertices`.
+   The `e25a048`/`156a430` `MRISsampleDistances` rewrite is **deprioritized** (targets identical).
+3. **Candidate fix to prototype** once step 1/2 localizes it: make FS8's initial flattened
+   state / ripped-face set match v6 (e.g. restore v6's `MRISripFaces` semantics or the v6
+   projection), then re-score flip-rate / J_d / opt-scale against the FS6 numbers above. A
+   `MRIS_FLATTEN_*` compatibility gate around whichever line diverges is the minimal,
+   reviewer-friendly form.
 
-Artifacts from the follow-up run (both flat patches, both `distance.log`s, scoring/plotting
-scripts, side-by-side figure) live at `/data2/projects/autoflatten/fs_regression/`.
+Artifacts: main run + `distance.log`s at `/data2/projects/autoflatten/fs_regression/`; step‑1 at
+`/data2/projects/autoflatten/fs_regression/fs8_{ctrl,sphere}/`. Ledger: `bb6e37461b5b` (main),
+`025f5efea56d` (step‑1).
 
 ---
 
